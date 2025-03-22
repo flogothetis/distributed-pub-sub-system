@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    restart: always
+    networks:
+      - pubsub_net
+
+
+  broker:
+    build: ./broker
+    environment:
+      - ZOOKEEPER_HOST=zookeeper:2181
+    deploy:
+      replicas: 3
+    ports:
+      - "5000" 
+    depends_on:
+      - zookeeper
+    networks:
+      - pubsub_net
+      
+  producer:
+    build: ./producer
+    container_name: producer
+    environment:
+      - ZOOKEEPER_HOST=zookeeper:2181
+    depends_on:
+      - zookeeper
+      - broker
+    ports:
+      - "4000:5000"
+    networks:
+      - pubsub_net
+
+
+networks:
+  pubsub_net:
+    driver: bridge
