@@ -53,7 +53,39 @@ app = FastAPI()
 zk.ensure_path("/brokers")
 broker_path = f"/brokers/{BROKER_ID}"
 brokers_set = set()
+zk.create(broker_path, json.dumps({"host": BROKER_HOST}).encode("utf-8"), ephemeral=True)
 
+def acquire_lock_with_retries(zk: KazooClient, lock_path: str, retries: int = 5, timeout: int = 5):
+    """
+    Attempt to acquire a ZooKeeper distributed lock with retries and exponential backoff.
+
+    Returns:
+        lock (kazoo.recipe.lock.Lock): the lock object (already acquired), or None if failed.
+    """
+    lock = zk.Lock(lock_path)
+    for attempt in range(retries):
+        try:
+            if lock.acquire(timeout=timeout):
+                logging.info(f"Acquired lock for {lock_path} on attempt {attempt + 1}")
+                return lock
+        except KazooException as e:
+            logging.warning(f"Attempt {attempt + 1} failed to acquire lock {lock_path}: {e}")
+        time.sleep(2 ** attempt)  # exponential backoff
+    logging.error(f"Failed to acquire lock {lock_path} after {retries} attempts.")
+    return None
+
+
+def release_lock_safely(lock):
+    """
+    Safely release a ZooKeeper lock if it's acquired.
+    """
+    try:
+        if lock is not None:
+            lock.release()
+            logging.info(f"Lock released for {lock.path}")
+    except KazooException as e:
+        logging.error(f"Failed to release lock {lock.path}: {e}")
+        
 @app.post("/replicate/{topic_ID}/{partition_ID}")
 
 def replicate_messages(topic_ID: str, partition_ID: int, messages: list):
@@ -97,79 +129,6 @@ def sync_data_from_leader(topic_ID, partition_ID, leader_broker):
     
     print(f"Failed to sync from leader {leader_broker} for {topic_ID} partition {partition_ID}")
     return {"error": "Failed to sync from leader", "broker": BROKER_ID}
-
-def rejoinAsFollower():
-    logging.info("Starting rejoinAsFollower process...")
-
-    try:
-        topics = zk.get_children("/topics")
-    except KazooException as e:
-        logging.error(f"Failed to retrieve topics: {str(e)}")
-        return
-
-    if not topics:
-        logging.info("No topics found in ZooKeeper.")
-        return
-
-    for topic in topics:
-        topic_path = f"/topics/{topic}"
-        topic_metadata = json.loads(zk.get(topic_path)[0].decode("utf-8"))
-        logging.info(f"Processing topic: {topic}")
-
-        for partition, partition_data in topic_metadata["partitions"].items():
-            logging.info(f"Processing partition {partition} for rejoinAsFollower...")
-
-            # If a broker rejoins, check if it was previously in ISR and not the current leader
-            if BROKER_ID not in partition_data["isr"] and BROKER_ID != partition_data["leader"]:
-                if BROKER_ID in partition_data.get("previous_isr", []):
-                    logging.info(f"Broker {BROKER_ID} was previously in ISR for {topic} partition {partition}. Attempting to rejoin.")
-
-                    lock = zk.Lock(f"/locks/{topic}/{partition}")
-                    acquired = False
-
-                    for attempt in range(5):  # Retry with exponential backoff
-                        try:
-                            if lock.acquire(timeout=5):
-                                logging.info(f"Acquired lock for /locks/{topic}/{partition} on attempt {attempt + 1}")
-                                acquired = True
-                                break
-                        except KazooException as e:
-                            logging.warning(f"Attempt {attempt + 1} failed to acquire lock for /locks/{topic}/{partition}: {e}")
-                            time.sleep(2 ** attempt)
-
-                    if not acquired:
-                        logging.error(f"Failed to acquire lock for /locks/{topic}/{partition} after 5 attempts. Skipping rejoin.")
-                        continue
-
-                    try:
-                        logging.info(f"Rejoining ISR for {topic} partition {partition}. Synchronizing data from leader...")
-                        sync_data_from_leader(topic, partition, partition_data["leader"])
-
-                        partition_data["isr"].append(BROKER_ID)
-                        partition_data["followers"].append(BROKER_ID)
-
-                        # Update metadata in ZooKeeper
-                        zk.set(topic_path, json.dumps(topic_metadata).encode("utf-8"))
-                        logging.info(f"Broker {BROKER_ID} successfully rejoined ISR for {topic} partition {partition}.")
-                    except KazooException as e:
-                        logging.error(f"Failed to update metadata for {topic} partition {partition}: {e}")
-                    finally:
-                        lock.release()
-                        logging.info(f"Lock released for /locks/{topic}/{partition}")
-                else:
-                    logging.info(f"Broker {BROKER_ID} not in ISR for {topic} partition {partition}. Skipping rejoin.")
-            else:
-                logging.info(f"Broker {BROKER_ID} already in ISR or is the leader for {topic} partition {partition}.")
-
-    
-
-
-try:
-    zk.create(broker_path, json.dumps({"host": BROKER_HOST}).encode("utf-8"), ephemeral=True)
-    rejoinAsFollower()
-except KazooException as e:
-    print(f"Failed to register broker: {str(e)}")
-
 
 
 
@@ -242,14 +201,13 @@ def read_messages(topic_ID: str, partition_ID: int):
 
     return {"messages": messages}
 
-def handle_dead_broker(dead_broker, executor_broker):
+def handle_dead_broker(dead_broker, executor_broker, executor_broker_path):
     logging.info(f"Handling dead broker event for {dead_broker} by {executor_broker}")
-    
+    topics =[]
     try:
-        topics = zk.get_children("/topics")
+        topics = zk.get_children("/topics",)
     except KazooException as e:
-        logging.error(f"Failed to retrieve topics: {str(e)}")
-        return
+        logging.error(f"No topics to retrieve")
     
     for topic in topics:
         topic_path = f"/topics/{topic}"
@@ -265,14 +223,25 @@ def handle_dead_broker(dead_broker, executor_broker):
                 logging.info(f"Broker {partition_data['isr'][0]} is now leader for {topic} partition {partition}")
 
             # Update ISR and followers, ensuring only available brokers remain
-            partition_data["isr"] = [b for b in partition_data["isr"] if  b != partition_data["leader"]]
-            partition_data["followers"] = [b for b in partition_data.get("followers", []) if b != partition_data["leader"]]
+            partition_data["isr"] = [b for b in partition_data["isr"] if  b != partition_data["leader"] and b != dead_broker]
+            partition_data["followers"] = [b for b in partition_data.get("followers", []) if b != partition_data["leader"] and b != dead_broker]
            
             try:
                 zk.set(topic_path, json.dumps(topic_metadata).encode("utf-8"))
                 logging.info(f"Metadata for {topic} updated successfully.")
             except KazooException as e:
                 logging.error(f"Failed to update metadata for {topic}: {str(e)}")
+    
+    #Remove the dead event from the zookeeper /events/dead_broker/{dead_broker}"
+    try:
+        # Delete the last znode (executor_broker_path)
+        zk.delete(executor_broker_path)
+        # Delete the parent znode if it exists and has no children
+        parent_path = "/".join(executor_broker_path.split("/")[:-1])
+        zk.delete(parent_path)
+        logging.info(f"Dead broker event {executor_broker_path} deleted successfully.")
+    except KazooException as e:
+        logging.error(f"Failed to delete dead broker event {executor_broker_path}: {str(e)}")
     
 
 
@@ -295,21 +264,51 @@ def monitor_dead_broker(dead_broker: str):
         try:
             zk.create(executor_broker_path, value=bytes(BROKER_ID, 'utf-8'),  ephemeral=True, sequence=False, makepath=True)
             logging.info(f"Broker {BROKER_ID} is the executor of the dead broker event.")
-            handle_dead_broker(dead_broker, BROKER_ID)
+            handle_dead_broker(dead_broker, BROKER_ID, executor_broker_path)
         except NodeExistsError as e:
             #Someone else is the executor
             logging.info(f"Broker {BROKER_ID} failed to be the executor of the dead broker event.")
             @zk.DataWatch(executor_broker_path)
             def watch_dead_broker_event(data, stat, event):
                 logging.info(f"Registered in watch_dead_broker_event")
+                
                 if event and event.type == "DELETED":
+                    if not zk.exists(dead_broker_path):
+                        logging.info(f"[{dead_broker}] Event fully cleaned up, not retrying.")
+                        return
                     logging.info(f"Call attempt_to_become_leader_executor_of_dead_event")
                     attempt_to_become_leader_executor_of_dead_event(dead_broker)
                   
     attempt_to_become_leader_executor_of_dead_event(dead_broker)
                 
             
-    
+def monitor_new_broker(broker):
+
+    # Only the broker which added right now is responsible to add itself as follower
+    # and update the metadata to avoid event creation and locking in zookeeper
+    if broker == BROKER_ID:
+        logging.info(f"Broker {broker} is new. Adding to ISR and followers.")
+        zk.ensure_path(f"/topics")
+        topics = zk.get_children("/topics")
+        for topic in topics:
+            topic_path = f"/topics/{topic}"
+            lock = acquire_lock_with_retries(zk, f"/locks/{topic}")
+            topic_metadata = json.loads(zk.get(topic_path)[0].decode("utf-8"))
+            for partition, partition_data in topic_metadata["partitions"].items():
+                if broker  in partition_data.get("previous_isr", []):
+                    #TODO : No need to get a full snashot of the partition data, only the missing data (offset difference)
+                    sync_data_from_leader(topic, partition, partition_data["leader"])
+                    partition_data["followers"].append(broker)
+                    partition_data["isr"].append(broker)
+                    zk.set(topic_path, json.dumps(topic_metadata).encode("utf-8"))
+                    logging.info(f"Metadata for {topic} updated successfully.")
+            release_lock_safely(lock)
+        #What if node not in previous_isr list but partition followers are under user spesified threshold
+
+            
+
+
+
 
 import time
 @zk.ChildrenWatch("/brokers")
@@ -327,9 +326,15 @@ def watch_broker_changes(brokers):
     global brokers_set
     current_brokers = set(brokers)
     dead_brokers = brokers_set - current_brokers
+    new_brokers = current_brokers - brokers_set
+    #Update new broker global list
     brokers_set = current_brokers
     for broker in dead_brokers:
         monitor_dead_broker(broker)
+        
+    for broker in new_brokers:
+        logging.info(f"New broker detected: {broker}")
+        monitor_new_broker(broker)
         
         
 
