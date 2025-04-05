@@ -4,7 +4,7 @@ import os
 import json
 import requests
 import time
-
+from typing import List
 
 '''
 /brokers/                   # Registered brokers
@@ -29,7 +29,7 @@ import time
 '''
 import logging
 import json
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException,  Body
 from kazoo.exceptions import NoNodeError, KazooException, NodeExistsError
 # Configure Logging
 logging.basicConfig(
@@ -87,8 +87,11 @@ def release_lock_safely(lock):
         logging.error(f"Failed to release lock {lock.path}: {e}")
         
 @app.post("/replicate/{topic_ID}/{partition_ID}")
-
-def replicate_messages(topic_ID: str, partition_ID: int, messages: list):
+def replicate_messages(
+    topic_ID: str,
+    partition_ID: int,
+    messages: List[dict] = Body(..., embed=True)  # expects {"messages": [...]}
+):
     partition_path = f"./data/{topic_ID}/partition_{partition_ID}.log"
     os.makedirs(os.path.dirname(partition_path), exist_ok=True)
 
@@ -189,17 +192,54 @@ def create_topic(topic_ID: str, num_partitions: int):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
     
-@app.get("/read/{topic_ID}/{partition_ID}")
-def read_messages(topic_ID: str, partition_ID: int):
+# ✅ Read from a specific offset (to end)
+@app.get("/read/{topic_ID}/{partition_ID}/offset/{offset}")
+def read_from_offset(
+    topic_ID: str,
+    partition_ID: int,
+    offset: int
+):
     partition_path = f"./data/{topic_ID}/partition_{partition_ID}.log"
 
     if not os.path.exists(partition_path):
-        return {"error": "Partition not found"}
+        raise HTTPException(status_code=404, detail="Partition not found")
+
+    with open(partition_path, "r") as f:
+        lines = f.readlines()
+
+    if offset < 0 or offset >= len(lines):
+        return {
+            "messages": [],
+            "start_offset": offset,
+            "end_offset": len(messages)
+        }
+
+
+    messages = [json.loads(line.strip()) for line in lines[offset:]]
+    return {
+        "messages": messages,
+        "start_offset": offset,
+        "end_offset": len(messages)
+    }
+
+
+# ✅ Read all messages (no offset)
+@app.get("/read/{topic_ID}/{partition_ID}")
+def read_all(topic_ID: str, partition_ID: int):
+    partition_path = f"./data/{topic_ID}/partition_{partition_ID}.log"
+
+    if not os.path.exists(partition_path):
+        raise HTTPException(status_code=404, detail="Partition not found")
 
     with open(partition_path, "r") as f:
         messages = [json.loads(line.strip()) for line in f.readlines()]
 
-    return {"messages": messages}
+    return {
+        "messages": messages,
+        "start_offset": 0,
+        "end_offset": len(messages)
+    }
+
 
 def handle_dead_broker(dead_broker, executor_broker, executor_broker_path):
     logging.info(f"Handling dead broker event for {dead_broker} by {executor_broker}")
@@ -341,7 +381,7 @@ def watch_broker_changes(brokers):
 
 # API: Write a message to a partition and replicate to followers
 @app.post("/write/{topic_ID}/{partition_ID}")
-def write_message(topic_ID: str, partition_ID: int, message: dict):
+def write_message(topic_ID: str, partition_ID: int, message: dict = Body(...)):
     partition_path = f"./data/{topic_ID}/partition_{partition_ID}.log"
     os.makedirs(os.path.dirname(partition_path), exist_ok=True)
 
